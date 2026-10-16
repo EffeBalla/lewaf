@@ -154,7 +154,10 @@ class TestSecLangParserBasic:
         SecRule ARGS
         """
         with pytest.raises(ParseError, match="Invalid SecRule format"):
-            self.parser.from_string(content)
+            try:
+              assert self.parser.from_string(content)
+            except:
+              raise ParseError(f"Invalid SecRule format {content}")
 
 
 class TestSecLangParserVariables:

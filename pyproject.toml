@@ -25,6 +25,7 @@ dependencies = [
     "redis>=7.0.1",
     "pyyaml>=6.0.3",
     "click>=8.2.1",
+    "msc-pyparser>=0.9",
 ]
 
 [project.urls]

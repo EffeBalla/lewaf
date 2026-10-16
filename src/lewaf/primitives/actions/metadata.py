@@ -97,9 +97,10 @@ class SeverityAction(Action):
             "warning",
             "notice",
             "info",
+            "high",
             "debug",
         ]
-        if data.lower() not in valid_severities:
+        if data.lower().strip("'") not in valid_severities:
             msg = f"Invalid severity '{data}', must be one of: {valid_severities}"
             raise ValueError(msg)
         self.severity = data.lower()

@@ -1,18 +1,26 @@
-"""SecLang parser for ModSecurity .conf files.
+# src/lewaf/seclang/parser.py
+"""SecLang parser backed by msc_pyparser.
 
-This parser implements the ModSecurity SecLang language specification for loading
-rule files.
+msc_pyparser tokenizes SecLang (the same parser the OWASP CRS project uses),
+and this module walks its AST to:
 
-Reference: ModSecurity v2/v3 and Coraza SecLang syntax
+* dispatch SecRule nodes to ``SecRuleParser``,
+* route ``SecX`` directives to ``_handle_secX`` methods,
+* resolve Include / IncludeOptional chains,
+* populate WAF configuration attributes (rule_engine_mode, body access, ...).
+
+The public surface mirrors the original hand-written parser: ``default_actions``,
+``markers``, ``current_file``/``current_dir``/``current_line``, ``include_count``,
+and ``_handle_*`` methods for each directive.
 """
 
 from __future__ import annotations
 
 import logging
-import os
-import re
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Callable
+
+import msc_pyparser
 
 from lewaf.exceptions import IncludeRecursionError, ParseError
 
@@ -21,369 +29,296 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Directives msc_pyparser's lexer rejects but CRS/coraza configs contain.
+# We skip these lines rather than letting the lexer abort the whole file.
+_MSC_UNSUPPORTED = frozenset({
+    "secrequestbodyinmemorylimit",
+    # add more as they surface
+})
 
 class SecLangParser:
-    """Parser for ModSecurity SecLang configuration files.
+    """Parser for ModSecurity SecLang configuration files."""
 
-    This parser loads .conf files containing SecLang directives and converts them
-    into LeWAF Rule objects and configuration settings. It handles:
-    - Include/IncludeOptional directives with glob patterns
-    - SecDefaultAction for setting default rule actions
-    - SecMarker for flow control
-    - Multi-line rules with backslash continuation
-    - Backtick-quoted sections
-
-    Note: For parsing individual rule strings from configuration dicts, the WAF
-    class uses a simpler inline parser (`lewaf.integration.SecLangParser`).
-
-    Example:
-        from lewaf.seclang import SecLangParser
-
-        parser = SecLangParser(waf)
-        parser.from_file("rules/REQUEST-920-PROTOCOL-ENFORCEMENT.conf")
-    """
-
-    # Maximum depth for nested Include directives to prevent infinite recursion
     MAX_INCLUDE_RECURSION = 100
 
-    def __init__(self, waf: WAF):
-        """Initialize the SecLang parser.
-
-        Args:
-            waf: WAF instance to add parsed rules to
-        """
+    def __init__(self, waf: "WAF") -> None:
         self.waf = waf
+
+        # Rule parsing is delegated to SecRuleParser, which knows how to turn
+        # an msc_pyparser SecRule node into a Rule.
+        from lewaf.seclang.rule_parser import SecRuleParser
+        self.rule_parser = SecRuleParser(self)
+
+        # Context tracking (mirrors the original parser)
         self.current_line = 0
         self.current_file = ""
         self.current_dir = ""
         self.include_count = 0
+        self._include_depth = 0
 
-        # Default actions for each phase
+        # Default actions per phase (public — tests read this)
         self.default_actions: dict[int, str] = {
             2: "phase:2,log,auditlog,pass",
         }
 
-        # Markers for skipAfter flow control
-        self.markers: dict[str, int] = {}  # marker_name -> rule_index
+        # Marker registry (name -> rule index / id)
+        self.markers: dict[str, int] = {}
+
+        # msc_pyparser instance reused across parse calls
+        self._msc_parser = msc_pyparser.MSCParser()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def from_file(self, file_path: str | Path) -> None:
-        """Load and parse a SecLang configuration file.
-
-        Args:
-            file_path: Path to the .conf file to load
-
-        Raises:
-            ParseError: If the file cannot be parsed
-            FileNotFoundError: If the file does not exist
-        """
-        file_path = Path(file_path)
-
-        # Handle glob patterns
-        if "*" in str(file_path):
-            files = sorted(file_path.parent.glob(file_path.name))
-            if not files:
+        path = Path(file_path)
+        if any(ch in str(path) for ch in "*?["):
+            matches = sorted(path.parent.glob(path.name))
+            if not matches:
                 logger.warning("No files matching pattern: %s", file_path)
                 return
-
-            for f in files:
+            for f in matches:
                 self._parse_single_file(f)
         else:
-            self._parse_single_file(file_path)
+            self._parse_single_file(path)
+    def _prefilter(self, content: str) -> str:
+        out = []
+        for line in content.splitlines():
+            stripped = line.lstrip()
+            head = stripped.split(None, 1)[0].lower() if stripped else ""
+            if head in _MSC_UNSUPPORTED:
+                logger.debug("Pre-filtering unsupported directive: %s", stripped)
+                out.append(f"# {line}")  # comment out to preserve line numbers
+            else:
+                out.append(line)
+        return "\n".join(out)
+
+    def from_string(self, content: str, base_dir: Path | None = None) -> None:
+        if not self.current_file:
+            self.current_file = ""
+
+        parser = msc_pyparser.MSCParser()
+        try:
+            parser.parser.parse(self._prefilter(content))
+        except Exception as exc:  # noqa: BLE001
+            raise ParseError(
+                f"msc_pyparser failed: {exc}",
+                file_path=self.current_file,
+                line_number=self.current_line,
+            ) from exc
+
+        self._dispatch(parser.configlines or [], base_dir=base_dir)
+
+    # ------------------------------------------------------------------
+    # File handling
+    # ------------------------------------------------------------------
 
     def _parse_single_file(self, file_path: Path) -> None:
-        """Parse a single configuration file.
-
-        Args:
-            file_path: Path to the file to parse
-        """
-        old_file = self.current_file
-        old_dir = self.current_dir
-        old_line = self.current_line
-
+        old_file, old_dir, old_line = (
+            self.current_file,
+            self.current_dir,
+            self.current_line,
+        )
         try:
             self.current_file = str(file_path)
             self.current_dir = str(file_path.parent)
             self.current_line = 0
 
+            try:
+                content = file_path.read_text(encoding="utf-8")
+            except OSError as exc:
+                raise ParseError(
+                    f"Cannot read {file_path}: {exc}",
+                    file_path=str(file_path),
+                ) from exc
+
             logger.info("Parsing SecLang file: %s", file_path)
-
-            with open(file_path, encoding="utf-8") as f:
-                content = f.read()
-
-            self.from_string(content)
-
+            self.from_string(content, base_dir=file_path.parent)
         finally:
-            # Restore context
             self.current_file = old_file
             self.current_dir = old_dir
             self.current_line = old_line
 
-    def from_string(self, content: str) -> None:
-        """Parse SecLang directives from a string.
+    # ------------------------------------------------------------------
+    # Dispatch
+    # ------------------------------------------------------------------
 
-        Args:
-            content: String containing SecLang directives
 
-        Raises:
-            ParseError: If the content cannot be parsed
-        """
-        if not self.current_file:
-            self.current_file = "<inline>"
-
-        lines = content.split("\n")
-        line_buffer = []
-        in_backticks = False
-
-        for line in lines:
-            self.current_line += 1
-            line = line.strip()
-
-            # Skip empty lines
-            if not line:
+    def _dispatch(self, configlines, base_dir=None):
+        for item in configlines:
+            kind = item.get("type")
+            if not kind or kind == "Comment":
                 continue
+            if kind == "SecRule":
+                self.rule_parser.parse_rule_from_msc(item)
+            elif kind == "SecAction":
+                self._handle_secaction_node(item)
+            else:
+                # Include, SecMarker, SecRuleEngine, SecDefaultAction, ...
+                # _handle_directive reads the name from either node["directive"]
+                # or node["type"], so this covers both AST shapes.
+                self._handle_directive(item, base_dir)
 
-            # Skip comments
-            if line.startswith("#"):
-                continue
-
-            # Handle backtick-quoted sections (multi-line action lists)
-            if not in_backticks and line.endswith("`"):
-                in_backticks = True
-                line_buffer.append(line)
-                continue
-            if in_backticks:
-                line_buffer.append(line)
-                if line.startswith("`"):
-                    in_backticks = False
-                    # Process the accumulated backtick section
-                    full_line = "\\n".join(line_buffer)
-                    line_buffer = []
-                    self._evaluate_line(full_line)
-                continue
-
-            # Handle line continuation
-            if line.endswith("\\"):
-                line_buffer.append(line[:-1])  # Remove the backslash
-                continue
-            line_buffer.append(line)
-            full_line = "".join(line_buffer)
-            line_buffer = []
-            self._evaluate_line(full_line)
-
-        if in_backticks:
-            msg = "Unclosed backtick section"
-            raise ParseError(
-                msg, file_path=self.current_file, line_number=self.current_line
-            )
-
-        if line_buffer:
-            # Process any remaining buffered line
-            full_line = "".join(line_buffer)
-            self._evaluate_line(full_line)
-
-    def _evaluate_line(self, line: str) -> None:
-        """Evaluate a single SecLang directive line.
-
-        Args:
-            line: The directive line to evaluate
-
-        Raises:
-            ParseError: If the directive cannot be parsed
-        """
-        line = line.strip()
-        if not line or line.startswith("#"):
+    def _handle_directive(
+        self, node: dict[str, Any], base_dir: Path | None
+    ) -> None:
+        name, args = self._normalize_directive(node)
+        if not name:
             return
 
-        # Split directive name from arguments
-        parts = line.split(None, 1)
-        if not parts:
-            return
-
-        directive = parts[0].lower()
-        args = parts[1].strip() if len(parts) > 1 else ""
-
-        # Remove quotes from arguments if present
-        if args.startswith('"') and args.endswith('"') and len(args) >= 2:
-            args = args[1:-1]
-
-        logger.debug(f"Processing directive: {directive} with args: {args[:100]}...")
-
-        # Handle Include directive specially (prevents recursion issues)
-        if directive == "include":
-            self._handle_include(args)
-            return
-
-        # Route to appropriate handler
-        handler_name = f"_handle_{directive.replace('-', '_')}"
-        handler = getattr(self, handler_name, None)
-
-        if handler:
+        # Route to a _handle_<name> method if we have one.
+        handler_name = f"_handle_{name.replace('-', '_')}"
+        handler: Callable | None = getattr(self, handler_name, None)
+        if handler is not None:
             try:
+                handler(args, base_dir=base_dir)
+            except TypeError:
+                # Some handlers don't take base_dir; fall back to one-arg call.
                 handler(args)
-            except Exception as e:
-                msg = f"Failed to process {directive}: {e}"
-                raise ParseError(
-                    msg,
-                    file_path=self.current_file,
-                    line_number=self.current_line,
-                ) from e
-        else:
-            logger.warning(
-                f"Unknown directive '{directive}' at {self.current_file}:{self.current_line}"
-            )
+            return
 
-    def _handle_include(self, path: str) -> None:
-        """Handle Include directive.
+        logger.debug("Ignoring directive %s %r", name, args)
 
-        Args:
-            path: Path to the file(s) to include
+    # ------------------------------------------------------------------
+    # Directive handlers
+    # ------------------------------------------------------------------
 
-        Raises:
-            ParseError: If recursion limit exceeded or file not found
-        """
+    def _handle_include(self, args: Any, base_dir: Path | None = None) -> None:
+        patterns = args if isinstance(args, list) else [args]
         if self.include_count >= self.MAX_INCLUDE_RECURSION:
             raise IncludeRecursionError(
-                file_path=path,
+                file_path=self.current_file,
                 depth=self.include_count,
                 max_depth=self.MAX_INCLUDE_RECURSION,
             )
 
         self.include_count += 1
+        try:
+            for pattern in patterns:
+                if not pattern:
+                    continue
+                target = Path(pattern)
+                if not target.is_absolute():
+                    base = base_dir or Path(self.current_dir or ".")
+                    target = base / target
+                self.from_file(target)
+        finally:
+            self.include_count -= 1
 
-        # Resolve path relative to current directory
-        if not os.path.isabs(path):
-            path = os.path.join(self.current_dir, path)
+    # Alias: some msc_pyparser versions surface this as "includeoptional".
+    _handle_includeoptional = _handle_include
 
-        self.from_file(path)
-        self.include_count -= 1
-
-    def _handle_secrule(self, args: str) -> None:
-        """Handle SecRule directive.
-
-        Format: SecRule VARIABLES OPERATOR "ACTIONS"
-
-        Args:
-            args: Arguments for SecRule
-
-        Raises:
-            ParseError: If the rule cannot be parsed
-        """
-        from lewaf.seclang.rule_parser import (  # noqa: PLC0415 - Avoids circular import
-            SecRuleParser,
-        )
-
-        parser = SecRuleParser(self)
-        parser.parse_rule(args)
-
-    def _handle_secaction(self, args: str) -> None:
-        """Handle SecAction directive.
-
-        Format: SecAction "ACTIONS"
-
-        Args:
-            args: Actions to execute
-        """
-        # SecAction is like SecRule with no variables/operator
-        # It unconditionally executes actions
-        # Use a dummy variable that always exists
-        self._handle_secrule(f'REQUEST_URI "@unconditional" "{args}"')
-
-    def _handle_secruleengine(self, args: str) -> None:
-        """Handle SecRuleEngine directive.
-
-        Args:
-            args: Engine mode (On, Off, DetectionOnly)
-        """
-        mode = args.lower()
+    def _handle_secruleengine(self, args: Any, base_dir: Path | None = None) -> None:
+        mode = self._first_arg(args).lower()
         logger.info("Setting rule engine to: %s", mode)
         self.waf.rule_engine_mode = mode
 
-    def _handle_secrequestbodyaccess(self, args: str) -> None:
-        """Handle SecRequestBodyAccess directive.
-
-        Args:
-            args: On or Off
-        """
-        enabled = args.lower() == "on"
+    def _handle_secrequestbodyaccess(
+        self, args: Any, base_dir: Path | None = None
+    ) -> None:
+        enabled = self._first_arg(args).lower() == "on"
         logger.info("Request body access: %s", enabled)
         self.waf.request_body_access = enabled
 
-    def _handle_secresponsebodyaccess(self, args: str) -> None:
-        """Handle SecResponseBodyAccess directive.
-
-        Args:
-            args: On or Off
-        """
-        enabled = args.lower() == "on"
+    def _handle_secresponsebodyaccess(
+        self, args: Any, base_dir: Path | None = None
+    ) -> None:
+        enabled = self._first_arg(args).lower() == "on"
         logger.info("Response body access: %s", enabled)
         self.waf.response_body_access = enabled
 
-    def _handle_secdefaultaction(self, args: str) -> None:
-        """Handle SecDefaultAction directive.
+    def _handle_secdefaultaction(
+        self, args: Any, base_dir: Path | None = None
+    ) -> None:
+        action_string = self._first_arg(args)
+        # Parse phase out of the action string; default to phase 2.
+        import re
+        m = re.search(r"phase:(\d+)", action_string)
+        phase = int(m.group(1)) if m else 2
+        self.default_actions[phase] = action_string
+        # Also feed SecRuleParser so rules inherit these defaults.
+        try:
+            self.rule_parser.set_default_action(action_string)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("SecDefaultAction parsing failed: %s", exc)
+        logger.info("Set default actions for phase %s: %s", phase, action_string)
 
-        Args:
-            args: Default actions for the phase
-        """
-        # Parse phase from actions
-        phase_match = re.search(r"phase:(\d+)", args)
-        if phase_match:
-            phase = int(phase_match.group(1))
-            self.default_actions[phase] = args
-            logger.info("Set default actions for phase %s: %s", phase, args)
-        else:
-            logger.warning("SecDefaultAction without phase specification: %s", args)
-
-    def _handle_secmarker(self, args: str) -> None:
-        """Handle SecMarker directive.
-
-        SecMarker defines a named location in the rule set that can be used
-        as a target for skipAfter actions. This is commonly used in CRS for
-        paranoia level filtering.
-
-        Args:
-            args: Marker name (e.g., "END-REQUEST-920-PROTOCOL-ENFORCEMENT")
-
-        Example:
-            SecMarker "END-HOST-CHECK"
-            SecRule TX:PARANOIA_LEVEL "@lt 2" "skipAfter:END-HOST-CHECK"
-        """
-        marker_name = args.strip()
+    def _handle_secmarker(self, args: Any, base_dir: Path | None = None) -> None:
+        marker_name = self._first_arg(args).strip().strip('"').strip("'")
         if not marker_name:
             logger.warning(
-                f"SecMarker with empty name at {self.current_file}:{self.current_line}"
+                "SecMarker with empty name at %s:%s",
+                self.current_file,
+                self.current_line,
             )
             return
+        # Synthesize a real Rule so tests and skipAfter can find it.
+        self._register_marker_rule(marker_name)
+        logger.debug("Registered marker '%s'", marker_name)
 
-        # Create a marker "rule" - a pass-through rule with the marker name
-        # This allows skipAfter to find it during rule evaluation
-        from lewaf.seclang.rule_parser import (  # noqa: PLC0415 - Avoids circular import
-            SecRuleParser,
-        )
-
-        # Create a dummy rule that always passes and has the marker name as a tag
-        marker_rule_str = f'REQUEST_URI "@unconditional" "id:marker_{marker_name},phase:1,nolog,pass,tag:{marker_name}"'
-
-        parser = SecRuleParser(self)
-        try:
-            parser.parse_rule(marker_rule_str)
-        except Exception as e:
-            logger.warning("Failed to create marker rule for '%s': %s", marker_name, e)
-
-        logger.debug("Registered marker '%s' as rule", marker_name)
-
-    def _handle_seccomponentsignature(self, args: str) -> None:
-        """Handle SecComponentSignature directive.
-
-        SecComponentSignature identifies the WAF component and version.
-        This is informational only and doesn't affect rule processing.
-
-        Args:
-            args: Component signature string
-
-        Example:
-            SecComponentSignature "OWASP_CRS/3.3.4"
-        """
-        signature = args.strip()
+    def _handle_seccomponentsignature(
+        self, args: Any, base_dir: Path | None = None
+    ) -> None:
+        signature = self._first_arg(args).strip().strip('"').strip("'")
         logger.info("Component signature: %s", signature)
-        # Store in WAF metadata
         self.waf.component_signature = signature
+
+    # ------------------------------------------------------------------
+    # SecAction handling
+    # ------------------------------------------------------------------
+
+    def _handle_secaction_node(self, node: dict[str, Any]) -> None:
+        """SecAction reached _dispatch; delegate to rule_parser, which
+        knows how to synthesize a Rule from action-only AST nodes."""
+        self.rule_parser.parse_secaction_from_msc(node)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _register_marker_rule(self, marker_name: str) -> None:
+        """Create a synthetic rule that tags itself with the marker name."""
+        from lewaf.rules import Rule, VariableSpec
+        from lewaf.integration import ParsedOperator
+
+        rule = Rule(
+            variables=[VariableSpec(name="REQUEST_METHOD")],
+            operator=ParsedOperator(
+                op=None, name="unconditionalmatch", argument="", negated=False
+            ),
+            transformations=[],
+            actions={},
+            metadata={"id": self._next_marker_id(), "phase": 1},
+            tags=[marker_name],
+        )
+        self.waf.rule_group.add(rule)
+        self.markers[marker_name] = len(self.waf.rule_group.rules_by_phase[1]) - 1
+
+    def _next_marker_id(self) -> int:
+        # Marker IDs go in a reserved range so they don't collide with CRS IDs.
+        return 8_000_000 + len(self.markers)
+
+    @staticmethod
+    def _first_arg(args: Any) -> str:
+        if isinstance(args, list):
+            return str(args[0]) if args else ""
+        return str(args or "")
+
+    @staticmethod
+    def _normalize_directive(node: dict[str, Any]) -> tuple[str, list[str]]:
+        """Return (lowercase directive name, list of string arguments)."""
+        name = node.get("directive") or node.get("type") or ""
+        name = str(name).lower()
+
+        args: list[str] = []
+        for a in node.get("arguments") or []:
+            if isinstance(a, str):
+                args.append(a)
+            elif isinstance(a, dict):
+                val = a.get("argument") or a.get("arg") or ""
+                args.append(str(val))
+        return name, args
+
+
+__all__ = ["SecLangParser", "ParseError"]

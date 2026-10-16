@@ -11,6 +11,7 @@ from lewaf.primitives.actions import ACTIONS
 from lewaf.primitives.operators import Operator, OperatorOptions, get_operator
 from lewaf.rules import Rule, VariableSpec
 from lewaf.transaction import Transaction
+from lewaf.seclang.parser import SecLangParser as FileSecLangParser  # msc_pyparser-backed
 
 
 @dataclass(frozen=True)
@@ -227,6 +228,9 @@ class SecLangParser:
                 if key == "tag":
                     tags.append(value)
 
+        for key, action in parsed_actions.items():
+            action.init(parsed_metadata, action.argument or "")
+
         rule = Rule(
             parsed_vars,
             parsed_operator,
@@ -260,6 +264,8 @@ class WAF:
         self.parser = SecLangParser(self.rule_group)
         self.component_signature: str = ""
 
+        # File parser for config["rule_files"] (globs, Include, etc.)
+        self.file_parser = FileSecLangParser(self)
         # Configuration directives (set by parser or programmatically)
         self.rule_engine_mode: str = "on"  # on, off, detectiononly
         self.request_body_access: bool = True
@@ -267,6 +273,8 @@ class WAF:
 
         for rule_str in config["rules"]:
             self.parser.from_string(rule_str)
+        for pattern in config.get("rule_files", []):
+          self.file_parser.from_file(pattern)
 
     def new_transaction(self) -> Transaction:
         """Create a new transaction with a unique ID.

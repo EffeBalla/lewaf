@@ -195,7 +195,7 @@ class TestSecLangParserCRS:
     def test_parse_multiple_transformations_real(self):
         """Test parsing rules with multiple transformations from real config."""
         content = r"""
-        SecRule REQUEST_HEADERS:Content-Type "^application/json" \
+          SecRule REQUEST_HEADERS:Content-Type "^application/json" \
              "id:'200001',phase:1,t:none,t:lowercase,pass,nolog,ctl:requestBodyProcessor=JSON"
         """
 
